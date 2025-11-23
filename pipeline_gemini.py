@@ -1,9 +1,11 @@
 import os
 import glob
+import zipfile
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from functools import reduce
 from scipy.optimize import curve_fit
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -28,124 +30,213 @@ class AerosolPipeline:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-    def find_sites(self):
-        """Scans input directory and groups files by Site Name."""
-        all_files = glob.glob(os.path.join(self.input_dir, "*.csv"))
-        sites = {}
-        
-        # Assumes format: DateRange_SiteName.type.csv
-        # Example: 20060101_20251231_ICIPE-Mbita.aod.csv
-        for f in all_files:
-            filename = os.path.basename(f)
-            try:
-                # Splitting by '.' to get the extension part (aod, cad, etc)
-                parts = filename.split('.')
-                file_type = parts[-2] # aod, cad, rin, ssa, tab
-                
-                # The prefix is everything before the first '.'
-                prefix = parts[0]
-                
-                if prefix not in sites:
-                    sites[prefix] = {}
-                sites[prefix][file_type] = f
-            except Exception as e:
-                print(f"Skipping file {filename}: {e}")
-                
-        return sites
+    def read_aeronet_file(self, filepath):
+        """
+        User-provided function to read AERONET files, finding headers dynamically
+        and prefixing columns to avoid duplicates.
+        """
+        try:
+            with open(filepath, 'r', encoding='latin1') as f:
+                lines = f.readlines()
+            
+            header_line = None
+            for i, line in enumerate(lines):
+                if "date" in line.lower() and "time" in line.lower():
+                    header_line = i
+                    break
+            
+            if header_line is None:
+                return None # Skip files without valid headers
 
-    def process_site_data(self, site_name, files):
+            df = pd.read_csv(filepath, skiprows=header_line, sep=",", engine="python")
+
+            # Standardize column names
+            df.columns = [c.strip() for c in df.columns]
+            
+            # Find Date and Time columns safely
+            date_cols = [c for c in df.columns if c.lower().startswith("date")]
+            time_cols = [c for c in df.columns if c.lower().startswith("time")]
+            
+            if not date_cols or not time_cols:
+                return None
+
+            df = df.rename(columns={date_cols[0]: "Date", time_cols[0]: "Time"})
+
+            # Keep only Date, Time, and measurement columns
+            measure_cols = [c for c in df.columns if c not in ["Date", "Time"]]
+
+            # Prefix measurement columns with file type (e.g., AOD_, SSA_)
+            file_prefix = os.path.splitext(os.path.basename(filepath))[1][1:].upper()
+            
+            # Select and rename
+            df = df[["Date", "Time"] + measure_cols]
+            df = df.rename(columns={col: f"{file_prefix}_{col}" for col in measure_cols})
+
+            return df
+        except Exception as e:
+            print(f"Warning: Could not read {filepath}: {e}")
+            return None
+
+    def process_zip_site(self, zip_path):
         """
-        Logic from DA-Exp2: Merges, Cleans, Imputes, Calculates FMF/AE, Classifies.
+        Extracts zip, merges files using user logic, and runs analysis.
         """
-        print(f"--- Processing Data for: {site_name} ---")
+        site_name = os.path.splitext(os.path.basename(zip_path))[0]
+        print(f"\n=== Processing Site: {site_name} ===")
+        
+        # Create unique extract folder for this site
+        extract_dir = os.path.join(self.input_dir, f"temp_{site_name}")
+        if not os.path.exists(extract_dir):
+            os.makedirs(extract_dir)
+
+        # 1. Unzip
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+        except zipfile.BadZipFile:
+            print(f"Error: {site_name} is a bad zip file.")
+            return
+
+        # 2. Read all valid files inside
+        dfs = []
+        file_paths = glob.glob(os.path.join(extract_dir, "*"))
+        # Looking for standard Aeronet extensions
+        valid_exts = (".aod", ".ssa", ".rin", ".cad", ".tab")
+        
+        for file in file_paths:
+            if file.lower().endswith(valid_exts):
+                print(f"  Reading {os.path.basename(file)}")
+                df = self.read_aeronet_file(file)
+                if df is not None:
+                    dfs.append(df)
+
+        if not dfs:
+            print(f"No valid data files found in {zip_path}")
+            return
+
+        # 3. Merge (User Logic: Reduce + Inner Join)
+        try:
+            df_merged = reduce(
+                lambda left, right: pd.merge(left, right, on=["Date", "Time"], how="inner"),
+                dfs
+            )
+        except Exception as e:
+            print(f"Error merging files for {site_name}: {e}")
+            return
+            
+        print(f"  Merged shape: {df_merged.shape}")
+
+        # 4. FIX COLUMN NAMES for Downstream Compatibility
+        # The merge created 'AOD_AOD_Extinction...' but we need 'AOD_Extinction...' for the formulas
+        new_columns = []
+        for col in df_merged.columns:
+            # Fix AOD double prefix
+            if col.startswith("AOD_AOD_"): 
+                new_columns.append(col.replace("AOD_AOD_", "AOD_"))
+            # Fix SSA double prefix (optional, if your formulas need it)
+            elif col.startswith("SSA_Single_"):
+                new_columns.append(col.replace("SSA_Single_", "Single_"))
+            # Keep original if no fix needed (Date, Time)
+            else:
+                new_columns.append(col)
+        
+        df_merged.columns = new_columns
+
+        # Clean up temp files
+        for f in file_paths:
+            os.remove(f)
+        os.rmdir(extract_dir)
+
+        # 5. Run the Physics & ML Pipelines
+        self.process_site_analysis(df_merged, site_name)
+
+    def process_site_analysis(self, df, site_name):
+        """
+        Runs the cleaning, AE/FMF calculation (Exp2) and ML (Exp3).
+        """
         site_out_dir = os.path.join(self.output_dir, site_name)
         if not os.path.exists(site_out_dir):
             os.makedirs(site_out_dir)
 
-        # 1. Load Data
-        required_types = ['aod', 'cad', 'rin', 'ssa', 'tab']
-        dfs = {}
-        for rt in required_types:
-            if rt not in files:
-                print(f"Missing {rt} file for {site_name}. Skipping site.")
-                return None
-            dfs[rt] = pd.read_csv(files[rt])
+        # --- CLEANING ---
+        df.replace(-999, np.nan, inplace=True)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
 
-        # 2. Merge
-        core_columns = dfs['aod'].iloc[:, :5] # Date, Time, etc.
-        unique_dfs = [dfs[t].iloc[:, 5:] for t in required_types]
-        merged_df = pd.concat([core_columns] + unique_dfs, axis=1)
+        # --- CALCULATIONS (AE & FMF) ---
+        # Ensure required columns exist
+        req_col_ae = 'AOD_Extinction-Total[440nm]'
+        if req_col_ae not in df.columns:
+            # Fallback: check if the prefix fix missed something or if data is missing
+            possible = [c for c in df.columns if "440nm" in c and "Total" in c]
+            if possible:
+                df.rename(columns={possible[0]: req_col_ae}, inplace=True)
+            else:
+                print(f"  Skipping AE Calc: Missing 440nm Total AOD in {site_name}")
+                return
 
-        # --- CRITICAL FIX: Remove Duplicate Columns ---
-        # This keeps the first occurrence of a column name and drops duplicates
-        merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
-        
-        # 3. Clean (-999 to NaN) and Impute (Median)
-        merged_df.replace(-999, np.nan, inplace=True)
-        # Select numeric columns for median calculation to avoid string errors
-        numeric_cols = merged_df.select_dtypes(include=[np.number]).columns
-        medians = merged_df[numeric_cols].median()
-        merged_df.fillna(medians, inplace=True)
-
-        # 4. Calculate AE (Angstrom Exponent)
-        # Formula: - ln(870/440) / ln(870/440) logic from your script
+        # AE Calculation
         try:
-            merged_df['AE'] = -(np.log(merged_df['AOD_Extinction-Total[870nm]'] / 
-                                       merged_df['AOD_Extinction-Total[440nm]']) / np.log(870/440))
-            
-            merged_df['AOD_Extinction-Total[500nm]'] = merged_df['AOD_Extinction-Total[440nm]'] * \
-                                                       ((500/440)**(-merged_df['AE']))
-        except KeyError:
-            print(f"Critical columns missing for AE calculation in {site_name}")
-            return None
+            df['AE'] = -(np.log(df['AOD_Extinction-Total[870nm]'] / df['AOD_Extinction-Total[440nm]']) / np.log(870/440))
+            df['AOD_Extinction-Total[500nm]'] = df['AOD_Extinction-Total[440nm]'] * ((500/440)**(-df['AE']))
+        except Exception as e:
+            print(f"  Error in AE Calc: {e}")
+            return
 
-        # 5. Calculate FMF (Fine Mode Fraction) - Curve Fitting
-        # Note: Optimized version of your loop
+        # FMF Calculation (Curve Fit)
         fmf_list = []
         wavelengths = np.array([440, 675, 870, 1020])
+        # Note: Depending on file version, these might be named differently.
+        # We try to find them dynamically if exact match fails.
+        total_cols = [f'AOD_Extinction-Total[{w}nm]' for w in wavelengths]
+        fine_cols = [f'AOD_Extinction-Fine[{w}nm]' for w in wavelengths]
+
+        # Check if fine mode columns exist (usually in .sda file or .aod V3 L2)
+        has_fine = all(c in df.columns for c in fine_cols)
         
-        total_cols = ['AOD_Extinction-Total[440nm]', 'AOD_Extinction-Total[675nm]',
-                      'AOD_Extinction-Total[870nm]', 'AOD_Extinction-Total[1020nm]']
-        fine_cols = ['AOD_Extinction-Fine[440nm]', 'AOD_Extinction-Fine[675nm]',
-                     'AOD_Extinction-Fine[870nm]', 'AOD_Extinction-Fine[1020nm]']
-
-        def poly2(x, a, b, c): return a * x**2 + b * x + c
-
-        for i, row in merged_df.iterrows():
-            try:
-                totals = row[total_cols].astype(float).values
-                fines = row[fine_cols].astype(float).values
-                
-                # Basic check to avoid log(<=0)
-                if np.any(totals <= 0) or np.any(fines <= 0):
+        if has_fine:
+            def poly2(x, a, b, c): return a * x**2 + b * x + c
+            
+            for i, row in df.iterrows():
+                try:
+                    totals = row[total_cols].astype(float).values
+                    fines = row[fine_cols].astype(float).values
+                    if np.any(totals <= 0) or np.any(fines <= 0):
+                        fmf_list.append(np.nan)
+                        continue
+                        
+                    log_tot = np.log(totals)
+                    log_fine = np.log(fines)
+                    
+                    popt_tot, _ = curve_fit(poly2, wavelengths, log_tot, maxfev=1000)
+                    popt_fine, _ = curve_fit(poly2, wavelengths, log_fine, maxfev=1000)
+                    
+                    tgt_tot = np.exp(poly2(550, *popt_tot))
+                    tgt_fine = np.exp(poly2(550, *popt_fine))
+                    
+                    fmf_list.append(tgt_fine / tgt_tot if tgt_tot != 0 else np.nan)
+                except:
                     fmf_list.append(np.nan)
-                    continue
+            df['FMF'] = fmf_list
+            df['FMF'] = df['FMF'].fillna(df['FMF'].median())
+        else:
+            print("  Warning: Fine Mode columns not found. FMF will be 0.5 (Placeholder).")
+            df['FMF'] = 0.5 # Placeholder to allow script to continue
 
-                log_tot = np.log(totals)
-                log_fine = np.log(fines)
-
-                popt_tot, _ = curve_fit(poly2, wavelengths, log_tot, maxfev=1000)
-                popt_fine, _ = curve_fit(poly2, wavelengths, log_fine, maxfev=1000)
-
-                target_aod_tot = np.exp(poly2(550, *popt_tot))
-                target_aod_fine = np.exp(poly2(550, *popt_fine))
-
-                fmf = target_aod_fine / target_aod_tot if target_aod_tot != 0 else np.nan
-                fmf_list.append(fmf)
-            except:
-                fmf_list.append(np.nan)
-        
-        merged_df['FMF'] = fmf_list
-        merged_df['FMF'] = merged_df['FMF'].fillna(merged_df['FMF'].median()) # Impute failed fits
-
-        # 6. Classification Logic (Label & Source)
+        # --- CLASSIFICATION ---
         def classify_aerosol(row):
-            SSA = row.get('Single_Scattering_Albedo[440nm]', 0.9) # Default safe fallback
+            # Using 'Single_Scattering_Albedo[440nm]' if available, else standard fallback
+            SSA = row.get('Single_Scattering_Albedo[440nm]', 0.9)
             FMF = row['FMF']
             AE = row['AE']
             
-            if FMF <= 0.4 and AE <= 0.6: return "CNA" if SSA > 0.95 else "CA"
-            elif 0.4 < FMF <= 0.6 and 0.6 < AE <= 1.2: return "MNA" if SSA > 0.95 else "MA"
+            # Coarse regime
+            if FMF <= 0.4 and AE <= 0.6:
+                return "CNA" if SSA > 0.95 else "CA"
+            # Mixed regime
+            elif 0.4 < FMF <= 0.6 and 0.6 < AE <= 1.2:
+                return "MNA" if SSA > 0.95 else "MA"
+            # Fine regime
             elif FMF > 0.6 and AE > 1.2:
                 if SSA > 0.95: return "FNA"
                 elif 0.9 <= SSA < 0.95: return "BCL"
@@ -154,8 +245,8 @@ class AerosolPipeline:
             return "Unclassified"
 
         def classify_source(row):
-            aod = row['AOD_Extinction-Total[500nm]']
-            ae = row['AE']
+            aod = row.get('AOD_Extinction-Total[500nm]', 0)
+            ae = row.get('AE', 0)
             if 0.2 <= aod <= 0.4 and ae > 1: return "Urban"
             elif aod < 0.3 and 0.5 <= ae <= 1.7: return "Maritime"
             elif aod > 0.4 and ae < 1: return "Desert"
@@ -163,160 +254,132 @@ class AerosolPipeline:
             elif aod > 0.45 and ae > 1.2: return "Arid"
             else: return "Unclassified"
 
-        merged_df['Label'] = merged_df.apply(classify_aerosol, axis=1)
-        merged_df['Source'] = merged_df.apply(classify_source, axis=1)
-
-        # 7. Add Season
+        df['Label'] = df.apply(classify_aerosol, axis=1)
+        df['Source'] = df.apply(classify_source, axis=1)
+        
+        # Season
+        # Parse Day of Year from Date
+        df['Day_of_Year'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce').dt.dayofyear
+        
         def get_season(day):
-            if 1 <= day <= 60 or 335 <= day <= 366: return "winter"
+            if pd.isna(day): return "Unknown"
+            if 1 <= day <= 60 or 335 <= day <= 366: return "Winter"
             elif 61 <= day <= 152: return "Pre monsoon"
             elif 153 <= day <= 244: return "Monsoon"
             elif 245 <= day <= 334: return "Post monsoon"
             return "Unknown"
-            
-        merged_df['Season'] = merged_df['Day_of_Year'].apply(get_season)
+        df['Season'] = df['Day_of_Year'].apply(get_season)
 
-        # Save Final CSV
-        final_path = os.path.join(site_out_dir, f'{site_name}_Processed.csv')
-        merged_df.to_csv(final_path, index=False)
-        print(f"Saved processed data to {final_path}")
-        
-        # Generate and Save Basic Plots (from Exp 2)
-        self.generate_exp2_plots(merged_df, site_name, site_out_dir)
-        
-        return merged_df
+        # Save Processed Data
+        out_path = os.path.join(site_out_dir, f'{site_name}_Processed.csv')
+        df.to_csv(out_path, index=False)
+        print(f"  Saved processed CSV to {out_path}")
 
-    def generate_exp2_plots(self, df, site_name, save_dir):
-        """Generates the visualization plots from Exp 2 and saves them."""
+        # --- VISUALIZATION (Plots from Exp 2) ---
+        print("  Generating Visualization Plots...")
+        
         # Plot 1: AOD vs AE by Label
-        plt.figure(figsize=(10,6))
-        sns.scatterplot(data=df, x="AE", y="AOD_Extinction-Total[500nm]", hue="Label", alpha=0.7)
-        plt.title(f"AOD vs AE (Label) - {site_name}")
-        plt.savefig(os.path.join(save_dir, 'plot_AOD_AE_Label.png'))
-        plt.close()
+        try:
+            plt.figure(figsize=(10, 6))
+            sns.scatterplot(data=df, x='AE', y='AOD_Extinction-Total[500nm]', hue='Label', alpha=0.7)
+            plt.title(f"AOD vs AE (Label) - {site_name}")
+            plt.grid(True)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.tight_layout()
+            plt.savefig(os.path.join(site_out_dir, 'Plot_AOD_AE_Label.png'))
+            plt.close()
+        except Exception as e:
+            print(f"  Could not plot Label Scatter: {e}")
 
-        # Plot 2: Source Distribution
-        plt.figure(figsize=(10,6))
-        df['Source'].value_counts().plot(kind='barh')
-        plt.title(f"Source Distribution - {site_name}")
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'plot_Source_Dist.png'))
-        plt.close()
+        # Plot 2: Source Distribution Bar Chart
+        try:
+            plt.figure(figsize=(10, 6))
+            df['Source'].value_counts().plot(kind='barh', color='teal')
+            plt.xlabel('Number of Entries')
+            plt.ylabel('Source')
+            plt.title(f"Source Distribution - {site_name}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(site_out_dir, 'Plot_Source_Dist.png'))
+            plt.close()
+        except Exception as e:
+            print(f"  Could not plot Source Distribution: {e}")
 
-    def run_ml_analysis(self, df, site_name):
-        """
-        Logic from DA-Exp3: Train ML models and export metrics.
-        """
-        print(f"--- Running ML Analysis for: {site_name} ---")
-        site_out_dir = os.path.join(self.output_dir, site_name)
-        
-        # Prepare Data
-        drop_cols = ["Time(hh:mm:ss)", "Date(dd:mm:yyyy)", "Site", "Day_of_Year"]
-        # Drop columns not needed for ML features
-        X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
-        
-        # We need to predict Source (or Label). Let's stick to 'Source' as per Exp3 logic mostly
-        if 'Source' not in df.columns: return
-        
-        y = df['Source']
-        X = X.drop(columns=['Source', 'Label', 'Season'], errors='ignore') # Ensure targets aren't in features
-        
-        # Filter rare classes (min 5 samples required for splits)
-        class_counts = y.value_counts()
-        valid_classes = class_counts[class_counts >= 5].index
-        mask = y.isin(valid_classes)
-        X = X[mask]
-        y = y[mask]
+        # --- ML ANALYSIS (Exp 3) ---
+        self.run_ml(df, site_name, site_out_dir)
 
-        if len(y.unique()) < 2:
-            print("Not enough classes for ML classification.")
+    def run_ml(self, df, site_name, site_out_dir):
+        # Filter for ML
+        valid_sources = df['Source'].value_counts()
+        valid_sources = valid_sources[valid_sources >= 5].index
+        df_ml = df[df['Source'].isin(valid_sources)].copy()
+        
+        if len(df_ml['Source'].unique()) < 2:
+            print("  Skipping ML: Not enough source classes.")
             return
+
+        # Prepare X and y
+        drop_cols = ['Date', 'Time', 'Source', 'Season', 'Day_of_Year', 'Label']
+        X = df_ml.drop(columns=[c for c in drop_cols if c in df_ml.columns], errors='ignore')
+        y = df_ml['Source']
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
 
-        # Preprocessing Pipeline
-        numeric_features = X.select_dtypes(include=[np.number]).columns
-        categorical_features = X.select_dtypes(exclude=[np.number]).columns
+        # Preprocessing (Force Dense for Naive Bayes)
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        cat_cols = X.select_dtypes(exclude=[np.number]).columns
 
-        # --- CRITICAL FIX: sparse_threshold=0 forces dense output for models like GaussianNB ---
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), numeric_features),
-                ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore'))]), categorical_features)
-            ],
-            sparse_threshold=0 
-        )
+        preprocessor = ColumnTransformer([
+            ('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), num_cols),
+            ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore'))]), cat_cols)
+        ], sparse_threshold=0) # <--- FIX for Sparse Error
 
         models = {
             "Decision Tree": DecisionTreeClassifier(random_state=42),
             "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-            "SVM": SVC(kernel="rbf", probability=True, random_state=42),
+            "SVM": SVC(probability=True, random_state=42),
             "KNN": KNeighborsClassifier(n_neighbors=5),
             "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
             "Naive Bayes": GaussianNB()
         }
 
         results = []
-
+        print("  Running ML Models...")
+        
         for name, model in models.items():
             try:
-                clf = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
+                clf = Pipeline([('prep', preprocessor), ('model', model)])
                 clf.fit(X_train, y_train)
                 y_pred = clf.predict(X_test)
                 
                 acc = accuracy_score(y_test, y_pred)
-                report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+                results.append({'Model': name, 'Accuracy': acc})
                 
-                results.append({
-                    'Site': site_name,
-                    'Model': name,
-                    'Accuracy': acc,
-                    'Macro F1': report['macro avg']['f1-score'],
-                    'Weighted F1': report['weighted avg']['f1-score']
-                })
-                
-                # Save Confusion Matrix
+                # Save CM
                 cm = confusion_matrix(y_test, y_pred)
-                plt.figure(figsize=(6,5))
+                plt.figure(figsize=(5,4))
                 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-                plt.title(f'{name} CM - {site_name}')
-                plt.ylabel('True')
-                plt.xlabel('Pred')
-                plt.savefig(os.path.join(site_out_dir, f'ML_CM_{name}.png'))
+                plt.title(f'{name} - {site_name}')
+                plt.savefig(os.path.join(site_out_dir, f'CM_{name}.png'))
                 plt.close()
             except Exception as e:
-                print(f"Error training {name} for {site_name}: {e}")
+                print(f"    Failed {name}: {e}")
 
-        # Save Metrics to CSV
-        if results:
-            results_df = pd.DataFrame(results)
-            results_df.to_csv(os.path.join(site_out_dir, f'{site_name}_ML_Metrics.csv'), index=False)
-            print(f"ML Metrics saved for {site_name}")
+        pd.DataFrame(results).to_csv(os.path.join(site_out_dir, 'ML_Results.csv'), index=False)
+        print("  ML Completed.")
 
     def execute(self):
-        sites = self.find_sites()
-        if not sites:
-            print("No matching file sets found in input directory.")
+        # Look for ZIP files
+        zip_files = glob.glob(os.path.join(self.input_dir, "*.zip"))
+        
+        if not zip_files:
+            print("No .zip files found in raw_data folder.")
             return
 
-        print(f"Found {len(sites)} sites to process.")
-        
-        for site, files in sites.items():
-            try:
-                # Step 1: Process (Exp 2)
-                processed_df = self.process_site_data(site, files)
-                
-                # Step 2: ML (Exp 3)
-                if processed_df is not None:
-                    self.run_ml_analysis(processed_df, site)
-                    
-            except Exception as e:
-                print(f"FATAL ERROR processing {site}: {e}")
-                # Continue to next site even if this one fails
-                continue
+        print(f"Found {len(zip_files)} zip files.")
+        for zip_path in zip_files:
+            self.process_zip_site(zip_path)
 
 if __name__ == "__main__":
-    # Create the pipeline and run it
-    # Ensure your raw csv files are in a folder named 'raw_data' next to this script
+    # Assumes you have a folder 'raw_data' with your .zip files
     pipeline = AerosolPipeline(input_dir='raw_data', output_dir='output')
     pipeline.execute()
